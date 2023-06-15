@@ -10,6 +10,10 @@
 #include <raylib.h>
 #include <float.h>
 
+#ifndef NN_MALLOC
+#define NN_MALLOC malloc
+#endif // !NN_MALLOC
+
 
 #define ARRAY_LEN(xs) sizeof((xs))/sizeof((xs)[0])
 
@@ -49,11 +53,21 @@ typedef struct {
 #define NN_OUTPUT(nn) (nn).as[(nn).n_layers]
 
 NN nn_alloc(size_t *arch, size_t arch_count);
+Mat* nn_act_alloc(NN nn);
 void nn_rand(NN nn, float low, float high);
 void nn_forward(NN nn);
 void nn_print(NN nn);
-void nn_backprop(NN nn, Mat ti, Mat to, float rate, size_t cost_div);
+void nn_backprop(NN nn, Mat *da, Mat ti, Mat to, float rate);
 float nn_sum_cost(NN nn, Mat ti, Mat to);
+void nn_process_batch(NN nn, Mat *da, Mat t, float rate, size_t current_batch, size_t batch_size, float* cost);
+
+typedef struct {
+    bool finished; 
+    float cost; 
+    size_t start;
+} Batch;
+
+void nn_process_batch_per_frame(NN nn, Mat *da, Mat t, float rate, Batch *b, size_t batch_size);
 
 typedef struct {
     float *items;
@@ -83,10 +97,10 @@ typedef struct {
 
 Box box_init(float w, float l, float xoffset, float yoffset, int draw_box);
 void nn_render(NN nn, Mat ti, size_t chosen_input, Box box, size_t *selected_neuron);
+void cost_plot_render(Plot plot, size_t epoch, size_t max_epochs, Box b);
 
 #endif // NN_H_ 
 
-#ifdef NN_IMPLEMENTATION
 
 int rand_int(int low, int high) {
     return low + rand()%(high-low+1);
@@ -119,7 +133,7 @@ Mat matrix_alloc(size_t rows, size_t cols) {
 	m.cols = cols;
 	m.stride = cols;
 	
-	m.ele = (float *) malloc(sizeof(*m.ele)*rows*cols);
+	m.ele = (float *) NN_MALLOC(sizeof(*m.ele)*rows*cols);
 	assert(m.ele != NULL);
 	
 	return m;
@@ -132,7 +146,7 @@ Mat matrix_eye_alloc(size_t n) {
 	m.cols = n;
 	m.stride = n;
 	
-	m.ele = (float *) malloc(sizeof(*m.ele)*n*n);
+	m.ele = (float *) NN_MALLOC(sizeof(*m.ele)*n*n);
 	assert(m.ele != NULL);
 	
 	for (size_t i = 0; i < n; i++) {
@@ -147,11 +161,12 @@ Mat matrix_eye_alloc(size_t n) {
 }
 
 Mat matrix_row(Mat m, size_t row) {
-    Mat out = VEC_ALLOC(m.cols);
-    for (size_t i = 0; i < m.cols; ++i) {
-        MAT_ELE(out, i, 0) = MAT_ELE(m, row, i);
-    }
-    return out;
+    return (Mat){
+        .rows = m.cols,
+        .cols = 1,
+        .stride = 1, 
+        .ele = &MAT_ELE(m, row, 0)
+    };
 }
 
 void matrix_populate(Mat m, float *a, size_t len_a) {
@@ -189,7 +204,6 @@ void matrix_fill(Mat m, float v) {
 
 void matrix_shuffle_rows(Mat m) {
     for (size_t i = 0; i < m.rows; ++i) {
-        //srand(time(NULL));
         size_t j = rand_int(i, m.rows-1);
         if (i!=j) {
             for (size_t k = 0; k < m.cols; ++k) {
@@ -283,11 +297,11 @@ NN nn_alloc(size_t *arch, size_t arch_count) {
     NN nn;
     nn.n_layers = arch_count-1;
 
-    nn.ws = malloc(sizeof(*nn.ws)*(nn.n_layers));
+    nn.ws = (Mat*)NN_MALLOC(sizeof(*nn.ws)*(nn.n_layers));
     assert(nn.ws!=NULL);
-    nn.bs = malloc(sizeof(*nn.bs)*(nn.n_layers));
+    nn.bs = (Mat*)NN_MALLOC(sizeof(*nn.bs)*(nn.n_layers));
     assert(nn.bs!=NULL);
-    nn.as = malloc(sizeof(*nn.as)*(nn.n_layers+1));
+    nn.as = (Mat*)NN_MALLOC(sizeof(*nn.as)*(nn.n_layers+1));
     assert(nn.as!=NULL);
 
     nn.as[0] = matrix_alloc(arch[0], 1);
@@ -300,6 +314,19 @@ NN nn_alloc(size_t *arch, size_t arch_count) {
     return nn;
 }
 
+Mat* nn_act_alloc(NN nn) {
+    Mat *a;
+    a = (Mat*)NN_MALLOC(sizeof(*a)*(nn.n_layers+1));
+    assert(a!=NULL);
+    for (size_t l = 0 ; l < nn.n_layers+1 ; ++l) {
+        a[l] = VEC_ALLOC(nn.as[l].rows);
+    }
+    return a;
+}
+
+void nn_print_act(Mat *a) {
+
+}
 void nn_rand(NN nn, float low, float high) {
     for (size_t l = 0; l < nn.n_layers; ++l) {
         matrix_rand(nn.ws[l], low, high);
@@ -325,21 +352,12 @@ void nn_print(NN nn) {
     }
 }
 
-void nn_backprop(NN nn, Mat ti, Mat to, float rate, size_t cost_div) {
+void nn_backprop(NN nn, Mat *da, Mat ti, Mat to, float rate) {
     assert(ti.cols == NN_INPUT(nn).rows);
     assert(to.cols == NN_OUTPUT(nn).rows);
     assert(ti.rows == to.rows);
 
     size_t n = ti.rows;  //number of inputs
-
-    //creating a duplicate of the NN activations to store dCda
-    Mat *da;
-    da = malloc(sizeof(*da)*(nn.n_layers+1));
-    assert(da!=NULL);
-
-    for (size_t l = 0; l < nn.n_layers+1; ++l) {
-        da[l] = VEC_ALLOC(nn.as[l].rows);
-    }
 
     for (size_t i = 0; i < n; ++i) {  // for every input
 
@@ -352,7 +370,7 @@ void nn_backprop(NN nn, Mat ti, Mat to, float rate, size_t cost_div) {
         }
 
         //setting dCda of the last layer as the difference (NN_OUTPUT - training_output)
-        for (size_t j = 0; j < NN_OUTPUT(nn).rows; ++j) {
+        for (size_t j = 0; j < to.rows; ++j) {
             MAT_ELE(da[nn.n_layers], j, 0) = (MAT_ELE(NN_OUTPUT(nn), j, 0) - MAT_ELE(to, i, j))*2/n;
         }
         
@@ -366,7 +384,7 @@ void nn_backprop(NN nn, Mat ti, Mat to, float rate, size_t cost_div) {
                     float w  = MAT_ELE(nn.ws[l-1], j, k);
                     float pa = MAT_ELE(nn.as[l-1], k, 0);  //previous activation
                     MAT_ELE(nn.ws[l-1], j, k) -= rate*dCda*ACT_PRIME(a)*pa;// DANGAROUS: not all activation functions can be expressed in terms of the activation itself, some might need to define z
-                    MAT_ELE(da[l-1], k, 0) = dCda*ACT_PRIME(a)*w;// DANGAROUS: not all activation functions can be expressed in terms of the activation itself, some might need to define z
+                    MAT_ELE(da[l-1], k, 0) += dCda*ACT_PRIME(a)*w;// DANGAROUS: not all activation functions can be expressed in terms of the activation itself, some might need to define z
                 }
             }
         }
@@ -395,6 +413,61 @@ float nn_sum_cost(NN nn, Mat ti, Mat to) {
     }
 
     return c;
+}
+
+/*            STOCHASTIC GRADIENT DECENT - USAGE
+size_t batches_per_epoch = (size_t) ceilf((float)train.rows/(float)batch_s);
+
+for (size_t i = 0 ; i < MAX_EPOCHS; ++i) {
+    float cost = 0;
+    matrix_shuffle_rows(train);
+    for (size_t j = 0 ; j < batches_per_epoch; ++j) {
+        nn_process_batch(nn, da, train, RATE, j, batch_s, &cost);
+    }
+} 
+*/
+void nn_process_batch(NN nn, Mat *da, Mat t, float rate, size_t current_batch, size_t batch_size, float* cost) {
+    size_t size = batch_size;  
+    if (t.rows-current_batch*batch_size < batch_size) {
+        size = t.rows-current_batch*batch_size;
+    }
+    Mat batch_in = {
+        .rows   = size,
+        .cols   = NN_INPUT(nn).rows,
+        .stride = t.stride,
+        .ele    = &MAT_ELE(t, current_batch*batch_size, 0),
+    };
+    Mat batch_out = {
+        .rows   = size,
+        .cols   = NN_OUTPUT(nn).rows,
+        .stride = t.stride,
+        .ele    = &MAT_ELE(t, current_batch*batch_size, batch_in.cols),
+    };
+    nn_backprop(nn, da, batch_in, batch_out, rate);
+    *cost += nn_sum_cost(nn, batch_in, batch_out)/t.rows;
+}
+
+void nn_process_batch_per_frame(NN nn, Mat *da, Mat t, float rate, Batch *b, size_t batch_size) {
+    size_t size = batch_size;  
+    if (t.rows - b->start < batch_size) {
+        size = t.rows-b->start;
+        b->finished = true;
+    }
+    Mat batch_in = {
+        .rows   = size,
+        .cols   = NN_INPUT(nn).rows,
+        .stride = t.stride,
+        .ele    = &MAT_ELE(t, b->start, 0),
+    };
+    Mat batch_out = {
+        .rows   = size,
+        .cols   = NN_OUTPUT(nn).rows,
+        .stride = t.stride,
+        .ele    = &MAT_ELE(t, b->start, batch_in.cols),
+    };
+    nn_backprop(nn, da, batch_in, batch_out, rate);
+    b->cost = nn_sum_cost(nn, batch_in, batch_out)/t.rows;
+    b->start += batch_size;
 }
 
 Box box_init(float w, float l, float xoffset, float yoffset, int draw_box) {
@@ -494,7 +567,7 @@ void nn_render(NN nn, Mat ti, size_t chosen_input, Box box, size_t *selected_neu
         }
     }
 
-            Color ring_color;
+    Color ring_color;
     //render the neorons
     for (size_t l = 0 ; l < nn.n_layers+1; ++l) {
         n = nn.as[l].rows;
@@ -569,5 +642,28 @@ void cost_plot_render(Plot plot, size_t epoch, size_t max_epochs, Box b) {
 
 }
 
-#endif // NN_IMPLEMENTATION 
+void acc_plot_render(Plot plot, Box b) {
+    float max = FLT_MIN;
+    float min = FLT_MAX;
+    float line_thick = b.l*0.01;
 
+    for (size_t i = 0 ; i < plot.count; ++i) {
+        if (plot.items[i]<min) min=plot.items[i];
+        if (plot.items[i]>max) max=plot.items[i];
+    }
+
+    if (min>0) min=0;
+        
+    for (size_t i = 0 ; i+1 < plot.count; ++i) {  //+1 to not draw on the first point 
+        size_t n = plot.count;
+        if (n<1000) n=1000;
+        float x1 = b.xpad + line_thick + b.w/n*i;
+        float x2 = b.xpad + line_thick + b.w/n*(i+1);
+        float y1 = b.ypad + ( 1 - (plot.items[i]-min)/(max-min) )*b.l;
+        float y2 = b.ypad + ( 1 - (plot.items[i+1]-min)/(max-min) )*b.l;
+        DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, line_thick*0.7, BLUE);
+    }
+
+
+
+}
